@@ -1,4 +1,4 @@
-// index.js - Versión optimizada para GLM-OCR (con soporte para tablas largas y limpieza de espacios)
+// index.js - Versión optimizada para GLM-OCR (ignora encabezados, soporte para tablas largas y limpieza de espacios)
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -48,36 +48,121 @@ const MODEL_NAME = process.env.MODEL_NAME || 'glm-ocr';
 
 console.log(`🤖 Usando modelo: ${MODEL_NAME}`);
 
+// ==================== FUNCIÓN PARA ELIMINAR ENCABEZADOS DE LA TABLA ====================
+/**
+ * Elimina las filas de encabezado de la tabla extraída.
+ * El modelo a veces incluye encabezados aunque se le indique que no lo haga.
+ * Esta función intenta detectar y eliminar la primera fila (o filas) de encabezado,
+ * así como la línea separadora de Markdown (|---|---|).
+ */
+function removeTableHeaders(text) {
+    if (!text) return text;
+
+    let lines = text.split('\n').map(l => l.trimEnd());
+
+    // Eliminar líneas vacías al inicio
+    while (lines.length > 0 && lines[0].trim() === '') {
+        lines.shift();
+    }
+    if (lines.length === 0) return text;
+
+    const firstLine = lines[0];
+    const isTableLine = (line) =>
+        line.includes('|') || line.includes('\t') || line.includes(';');
+
+    // Caso 1: Tabla en formato Markdown con separador |---|---|
+    if (isTableLine(firstLine) && lines.length > 1) {
+        const secondLine = lines[1];
+        // Detectar línea separadora de Markdown: |---|:---:|---|
+        const isSeparator = /^[\s|:\-]+$/.test(secondLine) && secondLine.includes('-');
+        if (isSeparator) {
+            // Eliminar encabezado (línea 0) y separador (línea 1)
+            lines.splice(0, 2);
+            // Eliminar posibles líneas vacías restantes al inicio
+            while (lines.length > 0 && lines[0].trim() === '') {
+                lines.shift();
+            }
+            return lines.join('\n');
+        }
+    }
+
+    // Caso 2: Tabla sin separador Markdown.
+    // Si la primera línea parece un encabezado (contiene texto no numérico
+    // en todas sus columnas) y la segunda línea contiene valores numéricos,
+    // asumimos que la primera es encabezado y la eliminamos.
+    if (isTableLine(firstLine) && lines.length > 1) {
+        const secondLine = lines[1];
+        if (isTableLine(secondLine)) {
+            const firstCols = firstLine.split(/[|\t;]/).map(c => c.trim()).filter(c => c !== '');
+            const secondCols = secondLine.split(/[|\t;]/).map(c => c.trim()).filter(c => c !== '');
+
+            if (firstCols.length > 0 && secondCols.length > 0) {
+                const firstHasNumbers = firstCols.some(c => /\d/.test(c));
+                const secondHasNumbers = secondCols.some(c => /\d/.test(c));
+
+                // Primera fila sin números y segunda con números => encabezado
+                if (!firstHasNumbers && secondHasNumbers) {
+                    lines.shift();
+                    // Eliminar posibles líneas vacías restantes al inicio
+                    while (lines.length > 0 && lines[0].trim() === '') {
+                        lines.shift();
+                    }
+                    return lines.join('\n');
+                }
+            }
+        }
+    }
+
+    // Caso 3: Texto libre (no tabla). Si la primera línea parece un título/encabezado
+    // (corta, sin números) y las siguientes contienen datos, la eliminamos.
+    if (!isTableLine(firstLine) && lines.length > 1) {
+        const nextNonEmpty = lines.find((l, i) => i > 0 && l.trim() !== '');
+        if (nextNonEmpty) {
+            const firstIsShort = firstLine.length < 60 && !/\d/.test(firstLine);
+            const nextHasData = /\d/.test(nextNonEmpty) || isTableLine(nextNonEmpty);
+            if (firstIsShort && nextHasData) {
+                lines.shift();
+                while (lines.length > 0 && lines[0].trim() === '') {
+                    lines.shift();
+                }
+                return lines.join('\n');
+            }
+        }
+    }
+
+    return lines.join('\n');
+}
+
 // ==================== FUNCIÓN PARA ELIMINAR ESPACIOS EN NÚMEROS ====================
 function removeSpacesInNumbers(text) {
     if (!text) return text;
-    
+
     // Elimina espacios entre dígitos (ej: "10 000" -> "10000")
     let cleaned = text.replace(/(\d)\s+(\d)/g, '$1$2');
-    
+
     // Elimina espacios alrededor de coma o punto decimal (ej: "10 , 5" -> "10,5")
     cleaned = cleaned.replace(/(\d)\s+([,.])\s+(\d)/g, '$1$2$3');
-    
+
     // Elimina espacios entre dígitos y coma/punto (ej: "10, 5" -> "10,5")
     cleaned = cleaned.replace(/(\d)([,.])\s+(\d)/g, '$1$2$3');
-    
+
     // Elimina espacios entre dígitos y coma/punto (ej: "10 ,5" -> "10,5")
     cleaned = cleaned.replace(/(\d)\s+([,.])(\d)/g, '$1$2$3');
-    
+
     return cleaned;
 }
 
 // ==================== FUNCIÓN PARA CONVERTIR COMAS A PUNTOS ====================
 function convertCommasToDots(text) {
     if (!text) return text;
-    
+
     const lines = text.split('\n');
     const convertedLines = lines.map(line => {
         if (line.includes('|') || line.includes('\t') || line.includes(';')) {
             let separator = '|';
             if (line.includes('\t')) separator = '\t';
             else if (line.includes(';')) separator = ';';
-            
+
             const columns = line.split(separator);
             const processedColumns = columns.map(col => {
                 let cleaned = col.trim();
@@ -113,15 +198,15 @@ function convertCommasToDots(text) {
 // ==================== FUNCIÓN PRINCIPAL: Extraer tabla ====================
 async function extractTableFromImage(imagePath, retries = 3) {
     let attempt = 0;
-    
+
     while (attempt <= retries) {
         try {
             console.log(`📸 Extrayendo tabla (intento ${attempt + 1}/${retries + 1})...`);
-            
+
             const imageBuffer = fs.readFileSync(imagePath);
             const stats = fs.statSync(imagePath);
             const fileSizeMB = stats.size / (1024 * 1024);
-            
+
             let optimizedBuffer;
             if (fileSizeMB > 2) {
                 optimizedBuffer = await sharp(imageBuffer)
@@ -134,15 +219,23 @@ async function extractTableFromImage(imagePath, retries = 3) {
                     .jpeg({ quality: 75 })
                     .toBuffer();
             }
-            
+
             const base64Image = optimizedBuffer.toString('base64');
             console.log(`📦 Imagen optimizada: ${(optimizedBuffer.length / 1024).toFixed(2)}KB`);
 
-            const prompt = `Table Recognition: Extract the complete table from this image. 
-            Include ALL rows and columns. Preserve the table structure.
-            Return the data in a clear tabular format.`;
+            // PROMPT MODIFICADO: instrucción explícita de IGNORAR ENCABEZADOS
+            const prompt = `Table Recognition: Extract ONLY the data rows from the table in this image.
+            CRITICAL INSTRUCTIONS:
+            - DO NOT include the header row(s) in your output.
+            - IGNORE all column titles, field names, or header labels completely.
+            - Skip any row that contains only text labels or titles.
+            - Start directly with the first row of actual data (numeric or value rows).
+            - Include ALL data rows and ALL columns.
+            - Preserve the table structure (separator |, tab, or ;).
+            - Do NOT add any header, title, or column name to the output.
+            Return ONLY the data rows in a clear tabular format.`;
 
-            console.log('📤 Enviando a GLM-OCR...');
+            console.log('📤 Enviando a GLM-OCR (ignorando encabezados)...');
 
             const response = await axios.post(`${OLLAMA_URL}/api/generate`, {
                 model: MODEL_NAME,
@@ -163,19 +256,20 @@ async function extractTableFromImage(imagePath, retries = 3) {
 
             let rawResponse = response.data.response.trim();
             rawResponse = rawResponse.replace(/```/g, '').replace(/markdown/g, '').trim();
-            
+
             if (rawResponse.includes('NO_TABLE') || rawResponse.length < 10) {
                 throw new Error('No se encontró ninguna tabla en la imagen');
             }
 
             const lines = rawResponse.split('\n');
-            const startIdx = lines.findIndex(line => 
+            const startIdx = lines.findIndex(line =>
                 line.includes('|') || line.includes('\t') || line.includes(';')
             );
-            
+
             if (startIdx === -1) {
-                // Limpiar espacios en números y convertir comas a puntos
-                const cleaned = removeSpacesInNumbers(rawResponse);
+                // Sin tabla estructurada: limpiar encabezados + espacios + comas
+                const withoutHeaders = removeTableHeaders(rawResponse);
+                const cleaned = removeSpacesInNumbers(withoutHeaders);
                 const convertedText = convertCommasToDots(cleaned);
                 return {
                     success: true,
@@ -184,21 +278,27 @@ async function extractTableFromImage(imagePath, retries = 3) {
                     converted: true
                 };
             }
-            
+
             let tableLines = lines.slice(startIdx);
             tableLines = tableLines.filter(line => line.trim() !== '');
-            const tableText = tableLines.join('\n');
+            let tableText = tableLines.join('\n');
 
             if (tableText.length < 10) {
                 throw new Error('La tabla extraída está vacía o es demasiado corta');
             }
 
-            // Limpiar espacios en números y luego convertir comas a puntos
+            // 1) Eliminar encabezados (aunque el modelo los haya incluido)
+            tableText = removeTableHeaders(tableText);
+            console.log('🧹 Encabezados eliminados (si existían)');
+
+            // 2) Limpiar espacios en números
             const cleanedTable = removeSpacesInNumbers(tableText);
+
+            // 3) Convertir comas decimales a puntos
             const convertedTable = convertCommasToDots(cleanedTable);
 
             const lineCount = convertedTable.split('\n').length;
-            console.log(`📊 Tabla extraída: ${lineCount} líneas`);
+            console.log(`📊 Tabla extraída (sin encabezados): ${lineCount} líneas`);
             console.log('📊 Primeras 3 líneas:');
             console.log(convertedTable.split('\n').slice(0, 3).join('\n'));
 
@@ -207,12 +307,13 @@ async function extractTableFromImage(imagePath, retries = 3) {
                 table: convertedTable,
                 raw: rawResponse,
                 converted: true,
+                headers_removed: true,
                 metadata: {
                     lines: lineCount,
                     characters: convertedTable.length
                 }
             };
-            
+
         } catch (error) {
             attempt++;
             console.error(`❌ Intento ${attempt} fallido:`, error.message);
@@ -267,7 +368,8 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString(),
         ollama_url: OLLAMA_URL,
         model_actual: MODEL_NAME,
-        modelos_disponibles: ['glm-ocr', 'llava:7b', 'qwen2.5-coder:7b']
+        modelos_disponibles: ['glm-ocr', 'llava:7b', 'qwen2.5-coder:7b'],
+        ignorar_encabezados: true
     });
 });
 
@@ -284,20 +386,22 @@ app.post('/api/extract-table', upload.single('image'), async (req, res) => {
         console.log(`\n📸 Procesando: ${req.file.originalname}`);
         console.log(`📏 Tamaño: ${(req.file.size / 1024).toFixed(2)}KB`);
         console.log(`🤖 Usando modelo: ${MODEL_NAME}`);
+        console.log(`🚫 Ignorando encabezados de tabla`);
         console.log(`🔄 Conversión automática: comas -> puntos y eliminación de espacios en números`);
-        
+
         optimizedPath = await optimizeImage(req.file.path);
         const imageToProcess = optimizedPath || req.file.path;
-        
+
         const result = await extractTableFromImage(imageToProcess);
-        
+
         cleanupFiles([req.file.path, optimizedPath]);
-        
+
         res.json({
             success: true,
-            table: result.table,            
+            table: result.table,
             modelo_usado: MODEL_NAME,
             conversion_aplicada: true,
+            encabezados_ignorados: true,
             metadata: {
                 filename: req.file.originalname,
                 size: req.file.size,
@@ -389,12 +493,14 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
     console.log('\n╔══════════════════════════════════════════════════════╗');
     console.log('║   🚀 SERVIDOR DE EXTRACCIÓN DE TABLAS               ║');
+    console.log('║   🚫 IGNORA ENCABEZADOS DE TABLA                    ║');
     console.log('║   🔄 CONVERSIÓN COMAS → PUNTOS Y LIMPIEZA DE ESPACIOS║');
     console.log('║   📋 SOPORTE PARA TABLAS LARGAS                     ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log(`\n📡 Servidor: http://0.0.0.0:${PORT}`);
     console.log(`🔗 Ollama: ${OLLAMA_URL}`);
     console.log(`🤖 Modelo actual: ${MODEL_NAME}`);
+    console.log(`🚫 Encabezados: IGNORADOS`);
     console.log(`🔄 Conversión: comas decimales → puntos`);
     console.log(`🔄 Limpieza: eliminación de espacios en números`);
     console.log(`📋 Límites:`);
