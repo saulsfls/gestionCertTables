@@ -3,7 +3,8 @@ const express = require('express');
 const cors = require('cors');
 
 const config = require('./config');
-const routes = require('./routes/routes');
+const routesTables = require('./routes/pimageroutes');
+const routesText = require('./routes/ptextroutes');
 
 const app = express();
 const PORT = config.port;
@@ -16,8 +17,11 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '100mb' }));
 
-// Rutas
-app.use('/api', routes);
+// Rutas de extracción de tablas por medio de una imagen
+app.use('/api/tablas', routesTables);
+
+// Rutas de extracción de texto por medio de una imagen
+app.use('/api/texto', routesText);
 
 // Manejador de errores global
 app.use((err, req, res, next) => {
@@ -29,31 +33,17 @@ app.use((err, req, res, next) => {
 });
 
 // ==================== INICIO ====================
-
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('\n╔══════════════════════════════════════════════════════╗');
-    console.log('║   🚀 SERVIDOR DE EXTRACCIÓN DE TABLAS               ║');
-    console.log('║   🚫 IGNORA ENCABEZADOS DE TABLA                    ║');
-    console.log('║   🔄 CONVERSIÓN COMAS → PUNTOS Y LIMPIEZA DE ESPACIOS║');
-    console.log('║   📋 SOPORTE PARA TABLAS LARGAS                     ║');
-    console.log('╚══════════════════════════════════════════════════════╝');
-    console.log(`\n📡 Servidor: http://0.0.0.0:${PORT}`);
-    console.log(`🔗 Ollama: ${config.ollamaUrl}`);
-    console.log(`🤖 Modelo actual: ${config.modelName}`);
-    console.log(`🚫 Encabezados: IGNORADOS`);
-    console.log(`🔄 Conversión: comas decimales → puntos`);
-    console.log(`🔄 Limpieza: eliminación de espacios en números`);
-    console.log(`📋 Límites:`);
-    console.log(`   - Archivo: 20MB`);
-    console.log(`   - Respuesta: 100MB`);
-    console.log(`   - Tokens: 8000`);
-    console.log(`   - Contexto: 4096`);
-    console.log(`   - Timeout: 10 minutos`);
-    console.log('\n📌 Comandos útiles:');
-    console.log(`   Health:   curl http://localhost:${PORT}/api/health`);
-    console.log(`   Modelos:  curl http://localhost:${PORT}/api/modelos-instalados`);
-    console.log(`   Imagen:   curl -X POST http://localhost:${PORT}/api/extract-table -F "image=@foto.jpg"`);
-    console.log('\n💡 SUGERENCIA: si GLM-OCR sigue fallando con decimales,');
-    console.log('   prueba con: ollama pull minicpm-v:8b');
-    console.log('   y luego:    MODEL_NAME=minicpm-v:8b npm start\n');
+    console.log(`\n🚀 Servidor en http://0.0.0.0:${PORT}\n`);
+    console.log(`📋 Rutas disponibles:\n`);
+    console.log(`  GET    /api/tablas/health                        → Estado del servicio de tablas`);
+    console.log(`  POST   /api/tablas/extract-table                 → Extrae tabla desde imagen`);
+    console.log(`  POST   /api/tablas/cambiar-modelo                → Cambia modelo Ollama (tablas)`);
+    console.log(`  GET    /api/tablas/check-model                   → Verifica modelo activo (tablas)`);
+    console.log(`  GET    /api/tablas/modelos-instalados            → Lista modelos en Ollama\n`);
+    console.log(`  GET    /api/texto/health                  → Estado del servicio de texto`);
+    console.log(`  POST   /api/texto/extract-text            → Extrae texto plano desde imagen`);
+    console.log(`  POST   /api/texto/cambiar-modelo          → Cambia modelo Ollama (texto)`);
+    console.log(`  GET    /api/texto/check-model             → Verifica modelo activo (texto)`);
+    console.log(`  GET    /api/texto/modelos-instalados      → Lista modelos en Ollama\n`);
 });
