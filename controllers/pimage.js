@@ -1,4 +1,4 @@
-// controllers/pimage.js - Procesamiento de imagen y llamada a GLM-OCR (filtrado conservador)
+// controllers/pimage.js - Procesamiento de imagen y llamada a GLM-OCR
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -7,35 +7,80 @@ const config = require('../config');
 
 console.log(`🤖 Modelo inicial: ${config.modelName}`);
 
-// ==================== PRIMER FILTRADO (CONSERVADOR) ====================
+// ==================== PRIMER FILTRADO (SIMPLE) ====================
 /**
- * Filtrado inicial sobre la respuesta cruda del modelo:
- *   1. Elimina espacios en blanco entre números (ej: "10 000" -> "10000", "10 , 5" -> "10,5")
- *   2. Convierte comas decimales a puntos (ej: "10,5" -> "10.5")
- *
- * NO elimina puntos de millar (ej: "1.234" se mantiene como "1.234")
- * para evitar falsos positivos con decimales de 3 cifras.
+ * Filtrado simple:
+ *   1. Elimina espacios en blanco entre números.
+ *   2. Cambia TODAS las comas por puntos.
  */
 function preFilter(text) {
     if (!text) return text;
 
     let cleaned = text;
 
-    // 1) Eliminar espacios en blanco entre números
-    // "10 000" -> "10000"
+    // 1) Eliminar espacios entre números: "10 000" -> "10000"
     cleaned = cleaned.replace(/(\d)\s+(\d)/g, '$1$2');
-    // "10 , 5" -> "10,5"
+    // Espacios alrededor de separadores: "10 , 5" -> "10,5"
     cleaned = cleaned.replace(/(\d)\s+([,.])\s+(\d)/g, '$1$2$3');
-    // "10, 5" -> "10,5"
-    cleaned = cleaned.replace(/(\d)([,.])\s+(\d)/g, '$1$2$3');
-    // "10 ,5" -> "10,5"
-    cleaned = cleaned.replace(/(\d)\s+([,.])(\d)/g, '$1$2$3');
 
-    // 2) Convertir comas decimales a puntos (solo entre dígitos)
-    // "10,5" -> "10.5"
-    cleaned = cleaned.replace(/(\d),(\d)/g, '$1.$2');
+    // 2) Todas las comas -> puntos
+    cleaned = cleaned.replace(/,/g, '.');
 
     return cleaned;
+}
+
+// ==================== DETECCIÓN DE HTML VÁLIDO ====================
+function looksLikeHtmlTable(s) {
+    const t = (s || '').trim().toLowerCase();
+    return t.startsWith('<table') && t.includes('</table>');
+}
+
+// ==================== FALLBACK: MARKDOWN -> HTML ====================
+function markdownTableToHtml(md) {
+    if (!md) return null;
+
+    const lines = md
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.startsWith('|') && l.includes('|', 1));
+
+    if (lines.length === 0) return null;
+
+    const parseRow = (line) =>
+        line.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+
+    const isSeparator = (cells) =>
+        cells.every(c => /^:?-{2,}:?$/.test(c));
+
+    let header = null;
+    const rows = [];
+
+    for (const line of lines) {
+        const cells = parseRow(line);
+        if (isSeparator(cells)) continue;
+        if (header === null) {
+            header = cells;
+        } else {
+            rows.push(cells);
+        }
+    }
+
+    if (!header && rows.length === 0) return null;
+
+    const esc = (s) =>
+        String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+
+    const th = header
+        ? `<thead><tr>${header.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>`
+        : '';
+    const tb = `<tbody>${rows
+        .map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`)
+        .join('')}</tbody>`;
+
+    return `<table>${th}${tb}</table>`;
 }
 
 // ==================== OPTIMIZAR IMAGEN EN DISCO ====================
@@ -47,7 +92,7 @@ async function optimizeImage(imagePath) {
             console.log(`📦 Imagen grande (${fileSizeInMB.toFixed(2)}MB), optimizando...`);
             const optimizedPath = imagePath.replace(/\.[^.]+$/, '_optimized.jpg');
             await sharp(imagePath)
-                .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
+                .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
                 .jpeg({ quality: 85 })
                 .toFile(optimizedPath);
             console.log('✅ Imagen optimizada');
@@ -74,6 +119,33 @@ function cleanupFiles(files) {
     });
 }
 
+// ==================== PROMPT (FEW-SHOT, PIDE HTML) ====================
+function buildPrompt() {
+    return `You are a table extraction engine. Convert the table in the image to a single HTML <table> element.
+
+RULES (follow exactly):
+1. Output ONLY valid HTML starting with <table> and ending with </table>. No markdown, no code fences, no explanations, no extra text.
+2. Include the header row inside <thead><tr><th>...</th></tr></thead>.
+3. Include all data rows inside <tbody><tr><td>...</td></tr></tbody>.
+4. Preserve rowspan/colspan ONLY if merged cells are clearly visible in the image.
+5. Copy numbers EXACTLY as printed in the image. Do NOT compute, round, or invent values.
+6. If a cell is empty in the image, output <td></td>.
+7. Use '.' as decimal separator. Do NOT convert to commas.
+8. Do NOT add columns, units, titles, or labels that are not present in the image.
+9. Do NOT repeat the header row inside <tbody>.
+
+EXAMPLE of the exact expected output format:
+<table>
+<thead><tr><th>Col A</th><th>Col B</th><th>Col C</th></tr></thead>
+<tbody>
+<tr><td>1.234</td><td>-0.05 ± 0.01</td><td>5.678</td></tr>
+<tr><td>9.999</td><td>0.00 ± 0.02</td><td>10.001</td></tr>
+</tbody>
+</table>
+
+Now extract the table from the image and return ONLY the HTML.`;
+}
+
 // ==================== FUNCIÓN PRINCIPAL: Extraer tabla ====================
 async function extractTableFromImage(imagePath, retries = 3) {
     let attempt = 0;
@@ -89,49 +161,42 @@ async function extractTableFromImage(imagePath, retries = 3) {
             const stats = fs.statSync(imagePath);
             const fileSizeMB = stats.size / (1024 * 1024);
 
-            let optimizedBuffer;
-            if (fileSizeMB > 2) {
-                optimizedBuffer = await sharp(imageBuffer)
-                    .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
-                    .jpeg({ quality: 85 })
-                    .toBuffer();
-            } else {
-                optimizedBuffer = await sharp(imageBuffer)
-                    .resize(600, 600, { fit: 'inside', withoutEnlargement: true })
-                    .jpeg({ quality: 75 })
-                    .toBuffer();
-            }
+            const targetSize = fileSizeMB > 4 ? 1400 : 1600;
+            const optimizedBuffer = await sharp(imageBuffer)
+                .resize(targetSize, targetSize, {
+                    fit: 'inside',
+                    withoutEnlargement: true
+                })
+                .jpeg({ quality: 88 })
+                .toBuffer();
 
             const base64Image = optimizedBuffer.toString('base64');
-            console.log(`📦 Imagen optimizada: ${(optimizedBuffer.length / 1024).toFixed(2)}KB`);
+            console.log(
+                `📦 Imagen optimizada: ${(optimizedBuffer.length / 1024).toFixed(2)}KB ` +
+                `(lado máx ${targetSize}px)`
+            );
 
-            const prompt = `Table Recognition: Extract ONLY the data rows from the table in this image.
-            CRITICAL INSTRUCTIONS:
-            - DO NOT include the header row(s) in your output.
-            - IGNORE all column titles, field names, or header labels completely.
-            - Skip any row that contains only text labels or titles.
-            - Start directly with the first row of actual data (numeric or value rows).
-            - Include ALL data rows and ALL columns.
-            - Preserve the table structure (separator |, tab, or ;).
-            - Do NOT add any header, title, or column name to the output.
-            Return ONLY the data rows in a clear tabular format.`;
+            const prompt = buildPrompt();
+            console.log('📤 Enviando a GLM-OCR (HTML + few-shot)...');
 
-            console.log('📤 Enviando a GLM-OCR (ignorando encabezados)...');
-
-            const response = await axios.post(`${ollamaUrl}/api/generate`, {
-                model: modelName,
-                prompt: prompt,
-                images: [base64Image],
-                stream: false,
-                options: {
-                    temperature: 0.1,
-                    num_predict: 8000,
-                    num_ctx: 4096,
-                    repeat_penalty: 1.1
-                }
-            }, {
-                timeout: 600000
-            });
+            const response = await axios.post(
+                `${ollamaUrl}/api/generate`,
+                {
+                    model: modelName,
+                    prompt: prompt,
+                    images: [base64Image],
+                    stream: false,
+                    options: {
+                        temperature: 0,
+                        num_predict: 8000,
+                        num_ctx: 8192,
+                        repeat_penalty: 1.0,
+                        top_p: 0.1,
+                        top_k: 10
+                    }
+                },
+                { timeout: 600000 }
+            );
 
             console.log('✅ Respuesta recibida');
 
@@ -141,21 +206,33 @@ async function extractTableFromImage(imagePath, retries = 3) {
                 throw new Error('No se encontró ninguna tabla en la imagen');
             }
 
-            // ===== PRIMER FILTRADO (CONSERVADOR) =====
-            const filtered = preFilter(rawResponse);
-            console.log('🧹 Primer filtrado aplicado (comas → puntos, espacios en números eliminados)');
+            let table = rawResponse.trim();
+
+            if (!looksLikeHtmlTable(table)) {
+                console.warn('⚠️ La respuesta no es HTML. Intentando convertir desde markdown...');
+                const html = markdownTableToHtml(table);
+                if (html) {
+                    console.log('🔁 Markdown convertido a HTML correctamente');
+                    table = html;
+                } else {
+                    throw new Error('La respuesta no es HTML ni markdown tabular convertible');
+                }
+            }
+
+            const filtered = preFilter(table);
+            console.log('🧹 Primer filtrado aplicado (comas -> puntos, espacios en números eliminados)');
 
             return {
                 success: true,
                 table: filtered,
                 raw: rawResponse,
                 filtered: true,
+                format: 'html',
                 metadata: {
                     characters: filtered.length,
                     lines: filtered.split('\n').length
                 }
             };
-
         } catch (error) {
             attempt++;
             console.error(`❌ Intento ${attempt} fallido:`, error.message);
@@ -167,9 +244,12 @@ async function extractTableFromImage(imagePath, retries = 3) {
     }
 }
 
+// ==================== EXPORTS ====================
 module.exports = {
     extractTableFromImage,
     optimizeImage,
     cleanupFiles,
-    preFilter
+    preFilter,
+    looksLikeHtmlTable,
+    markdownTableToHtml
 };
