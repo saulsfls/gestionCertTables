@@ -3,7 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
-const { JSDOM } = require('jsdom'); // Necesitarás instalar: npm install jsdom
+const { JSDOM } = require('jsdom'); // npm install jsdom
 const config = require('../config');
 
 console.log(`🤖 Modelo inicial: ${config.modelName}`);
@@ -12,8 +12,11 @@ console.log(`🤖 Modelo inicial: ${config.modelName}`);
 function preFilter(text) {
     if (!text) return text;
     let cleaned = text;
+    // Une números separados por espacios (ej. "1 000" -> "1000")
     cleaned = cleaned.replace(/(\d)\s+(\d)/g, '$1$2');
+    // Une números separados por espacios alrededor de comas o puntos
     cleaned = cleaned.replace(/(\d)\s+([,.])\s+(\d)/g, '$1$2$3');
+    // Reemplaza comas por puntos para decimales
     cleaned = cleaned.replace(/,/g, '.');
     return cleaned;
 }
@@ -46,7 +49,46 @@ function markdownTableToHtml(md) {
     return `<table>${th}${tb}</table>`;
 }
 
-// ==================== OPTIMIZAR IMAGEN ====================
+// ==================== PREPROCESAMIENTO AVANZADO PARA TABLAS ====================
+/**
+ * Mejora la imagen para que el modelo OCR vea las líneas de la tabla y el texto con mayor claridad.
+ * Aplica: Redimensionado, Escala de grises, Normalización, Enfoque y Binarización.
+ */
+async function preprocessImageForTable(imageBuffer) {
+    try {
+        const metadata = await sharp(imageBuffer).metadata();
+        
+        // 1. Redimensionar si es muy grande (mantener legibilidad sin exceder límites del modelo)
+        let width = metadata.width;
+        let height = metadata.height;
+        const maxDim = 2000;
+        
+        if (width > maxDim || height > maxDim) {
+            const ratio = Math.min(maxDim / width, maxDim / height);
+            width = Math.floor(width * ratio);
+            height = Math.floor(height * ratio);
+        }
+
+        // 2. Pipeline de mejora
+        let pipeline = sharp(imageBuffer)
+            .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+            .grayscale() // Pasar a blanco y negro
+            .normalize() // Estirar el histograma (mejora contraste global)
+            .sharpen({ sigma: 1.5, m1: 1.0, m2: 2.0 }); // Enfocar el texto y líneas
+
+        // 3. Binarización (Opcional pero muy útil para tablas con líneas tenues)
+        // Un umbral de 180 suele funcionar bien para fondos blancos con texto negro.
+        // Si tus imágenes son oscuras, considera quitar esta línea.
+        pipeline = pipeline.threshold(180); 
+
+        return await pipeline.jpeg({ quality: 95 }).toBuffer();
+    } catch (error) {
+        console.error('⚠️ Error en preprocesamiento, usando imagen original:', error.message);
+        return imageBuffer; // Fallback a la imagen original
+    }
+}
+
+// ==================== OPTIMIZAR IMAGEN (LEGACY) ====================
 async function optimizeImage(imagePath) {
     try {
         const stats = fs.statSync(imagePath);
@@ -75,30 +117,27 @@ function cleanupFiles(files) {
 
 // ==================== PROMPT GENÉRICO MEJORADO ====================
 function buildPrompt(isRightSide = false) {
+    const commonRules = `
+CRITICAL RULES:
+1. Output ONLY valid HTML starting with <table> and ending with </table>.
+2. Use '.' as decimal separator. Do NOT use commas for decimals.
+3. If a cell is empty, output <td></td>.
+4. Preserve rowspan and colspan EXACTLY as seen in the image. If a cell spans multiple rows, use <td rowspan="N">. If it spans columns, use <td colspan="N">.
+5. Do NOT invent new columns. If you see a thick line, it might just be a visual separator, not a new column. Only create a new column if there is distinct text in that column for multiple rows.
+6. Read the numbers carefully. Do not hallucinate zeros.
+`;
+
     if (isRightSide) {
-        return `You are a table extraction engine. The image contains a single vertical column (or a small detached block) that belongs to a larger table.
-Convert it into a valid HTML <table> element with a single <tr> per row.
-RULES:
-1. Output ONLY valid HTML.
-2. Include the header row in <thead>.
-3. Output <td></td> if a cell is empty.
-4. Do NOT add extra text.`;
+        return `You are a table extraction engine. The image contains a DETACHED COLUMN or a RIGHT PART of a larger table.
+Convert it into a valid HTML <table> element.
+${commonRules}
+7. Output ONLY the columns visible in this image. Do not try to guess the left columns.
+Return ONLY the HTML.`;
     }
 
     return `You are an expert table extraction engine. Convert the table in the image to a single HTML <table> element.
-
-CRITICAL RULES:
-1. Output ONLY valid HTML starting with <table> and ending with </table>.
-2. Scan the image from LEFT to RIGHT edge. Include ALL visible columns, even if they are separated by a thick vertical line, a large white gap, or appear visually detached (e.g., a calculated value on the far right).
-3. If a cell is empty, output <td></td>.
-4. Use '.' as decimal separator.
-5. Preserve rowspan/colspan if merged cells are visible.
-6. Do NOT omit columns just because they look like a separate table. If it shares the same rows, include it as a column.
-
-EXAMPLE:
-If you see a main table with 3 columns, and a separated column on the right with a thick line, the output MUST have 4 columns: <th>Col1</th><th>Col2</th><th>Col3</th><th>DetachedCol</th>.
-The row must be: <tr><td>data1</td><td>data2</td><td>data3</td><td>data4</td></tr>
-
+${commonRules}
+7. Scan from LEFT to RIGHT. Include ALL visible columns. If a column is separated by a thick vertical line but shares the same rows, include it.
 Return ONLY the HTML.`;
 }
 
@@ -106,6 +145,7 @@ Return ONLY the HTML.`;
 async function callModel(imageBuffer, isRightSide = false) {
     const base64Image = imageBuffer.toString('base64');
     const prompt = buildPrompt(isRightSide);
+    
     const response = await axios.post(
         `${config.ollamaUrl}/api/generate`,
         {
@@ -113,7 +153,12 @@ async function callModel(imageBuffer, isRightSide = false) {
             prompt: prompt,
             images: [base64Image],
             stream: false,
-            options: { temperature: 0, num_predict: 8000, num_ctx: 8192, top_p: 0.1 }
+            options: { 
+                temperature: 0, 
+                num_predict: 8000, 
+                num_ctx: 8192, 
+                top_p: 0.1 
+            }
         },
         { timeout: 600000 }
     );
@@ -168,6 +213,75 @@ function mergeHtmlTables(htmlLeft, htmlRight) {
     }
 }
 
+// ==================== SPLIT CON SOLAPAMIENTO ====================
+/**
+ * Corta la imagen a la mitad, pero con un 10% de solapamiento para no cortar columnas por la mitad.
+ */
+async function extractWithSplit(imageBuffer, metadata) {
+    const width = metadata.width;
+    const height = metadata.height;
+    const overlap = Math.floor(width * 0.1); // 10% de solapamiento
+    const splitX = Math.floor(width * 0.5);
+
+    // Izquierda (0 a splitX + overlap)
+    const leftBuffer = await sharp(imageBuffer)
+        .extract({ left: 0, top: 0, width: splitX + overlap, height: height })
+        .jpeg({ quality: 95 })
+        .toBuffer();
+
+    // Derecha (splitX - overlap a width)
+    const rightBuffer = await sharp(imageBuffer)
+        .extract({ left: splitX - overlap, top: 0, width: width - (splitX - overlap), height: height })
+        .jpeg({ quality: 95 })
+        .toBuffer();
+
+    const [resLeft, resRight] = await Promise.all([
+        callModel(leftBuffer, false),
+        callModel(rightBuffer, true)
+    ]);
+
+    return { resLeft, resRight };
+}
+
+// ==================== VALIDACIÓN DE ESTRUCTURA (OPCIONAL) ====================
+/**
+ * Verifica que el número de columnas en el body coincida con el header.
+ * Útil para detectar si el modelo alucinó columnas extra.
+ */
+function validateTableStructure(html) {
+    try {
+        const dom = new JSDOM(html);
+        const table = dom.window.document.querySelector('table');
+        if (!table) return false;
+        
+        const headers = table.querySelectorAll('thead th').length;
+        if (headers === 0) return false;
+
+        const rows = table.querySelectorAll('tbody tr');
+        let validRows = 0;
+        
+        for (let row of rows) {
+            const cells = row.querySelectorAll('td, th');
+            let totalCols = 0;
+            cells.forEach(cell => {
+                const colspan = parseInt(cell.getAttribute('colspan')) || 1;
+                totalCols += colspan;
+            });
+            
+            // Si la fila tiene el mismo número de columnas que el header, es válida
+            // (Ignoramos filas con rowspan complejo para esta validación básica)
+            if (totalCols === headers) {
+                validRows++;
+            }
+        }
+        
+        // Si al menos el 50% de las filas son válidas, consideramos la tabla aceptable
+        return validRows >= (rows.length * 0.5);
+    } catch (e) {
+        return false;
+    }
+}
+
 // ==================== FUNCIÓN PRINCIPAL ====================
 async function extractTableFromImage(imagePath, retries = 3) {
     let attempt = 0;
@@ -175,16 +289,12 @@ async function extractTableFromImage(imagePath, retries = 3) {
         try {
             console.log(`📸 Extrayendo tabla (intento ${attempt + 1}/${retries + 1})...`);
             const imageBuffer = fs.readFileSync(imagePath);
-            const stats = fs.statSync(imagePath);
-            const fileSizeMB = stats.size / (1024 * 1024);
+            
+            // 1. PREPROCESAMIENTO AVANZADO
+            const optimizedBuffer = await preprocessImageForTable(imageBuffer);
+            const metadata = await sharp(optimizedBuffer).metadata();
 
-            const targetSize = fileSizeMB > 4 ? 1400 : 1600;
-            const optimizedBuffer = await sharp(imageBuffer)
-                .resize(targetSize, targetSize, { fit: 'inside', withoutEnlargement: true })
-                .jpeg({ quality: 88 })
-                .toBuffer();
-
-            // 1. Intento con la imagen completa
+            // 2. PRIMER INTENTO (Imagen completa)
             let rawResponse = await callModel(optimizedBuffer, false);
             
             if (!rawResponse.trim() || rawResponse.includes('NO_TABLE')) {
@@ -192,59 +302,64 @@ async function extractTableFromImage(imagePath, retries = 3) {
             }
 
             let table = rawResponse.trim();
+            
+            // 3. VERIFICAR SI EL MODELO OMITIÓ COLUMNAS
+            let dom = new JSDOM(table);
+            let tableEl = dom.window.document.querySelector('table');
+            let colCount = tableEl ? tableEl.querySelectorAll('thead th').length : 0;
 
-            // 2. Verificar si el modelo omitió la columna separada
-            // Una heurística: si el modelo detectó pocas columnas en tablas muy anchas, o si falló.
-            // Para ser genéricos, haremos un split de la imagen a la mitad (50%) y compararemos.
-            const dom = new JSDOM(table);
-            const tableEl = dom.window.document.querySelector('table');
-            const colCount = tableEl ? tableEl.querySelectorAll('thead th').length : 0;
+            // Heurística: Si el modelo detectó muy pocas columnas (ej. 2 o 3) 
+            // pero la imagen es ancha (aspect ratio > 1.5), intentamos el split.
+            const isWide = metadata.width > (metadata.height * 1.5);
+            const likelyMissedColumns = colCount <= 4 && isWide;
 
-            // Si tiene 6 columnas o menos y la imagen es ancha (aspect ratio > 1.5), intentamos el split
-            const metadata = await sharp(imageBuffer).metadata();
-            const isWide = metadata.width > (metadata.height * 1.2);
-
-            if (colCount <= 6 && isWide) {
-                console.log('⚠️ Posible columna omitida. Iniciando extracción por partes (Split 50/50)...');
+            if (likelyMissedColumns) {
+                console.log('⚠️ Posible columna omitida. Iniciando extracción con Split + Overlap...');
                 
-                const width = metadata.width;
-                const height = metadata.height;
-                const splitX = Math.floor(width * 0.5); // Cortar a la mitad
-
-                const leftBuffer = await sharp(imageBuffer).extract({ left: 0, top: 0, width: splitX, height: height }).jpeg().toBuffer();
-                const rightBuffer = await sharp(imageBuffer).extract({ left: splitX, top: 0, width: width - splitX, height: height }).jpeg().toBuffer();
-
-                const [resLeft, resRight] = await Promise.all([
-                    callModel(leftBuffer, false),
-                    callModel(rightBuffer, true)
-                ]);
+                const { resLeft, resRight } = await extractWithSplit(optimizedBuffer, metadata);
 
                 if (looksLikeHtmlTable(resLeft) && looksLikeHtmlTable(resRight)) {
                     console.log('✅ Uniendo tablas izquierda y derecha...');
-                    table = mergeHtmlTables(resLeft, resRight);
+                    const mergedTable = mergeHtmlTables(resLeft, resRight);
+                    
+                    // Validar que la tabla unida tenga sentido
+                    if (validateTableStructure(mergedTable)) {
+                        table = mergedTable;
+                    } else {
+                        console.log('⚠️ Tabla unida no pasó la validación, usando respuesta original.');
+                    }
+                } else {
+                    console.log('⚠️ Split falló (respuestas no son HTML), usando respuesta original.');
                 }
             }
 
-            // 3. Si no era HTML, intentar Markdown
+            // 4. Fallback a Markdown si no es HTML
             if (!looksLikeHtmlTable(table)) {
                 const html = markdownTableToHtml(table);
                 if (html) table = html;
                 else throw new Error('La respuesta no es HTML ni markdown tabular convertible');
             }
 
+            // 5. Aplicar filtro de limpieza
             const filtered = preFilter(table);
+            
             return {
                 success: true,
                 table: filtered,
                 raw: rawResponse,
                 filtered: true,
                 format: 'html',
-                metadata: { characters: filtered.length }
+                metadata: { 
+                    characters: filtered.length,
+                    columnsDetected: colCount,
+                    usedSplit: likelyMissedColumns
+                }
             };
         } catch (error) {
             attempt++;
             console.error(`❌ Intento ${attempt} fallido:`, error.message);
             if (attempt > retries) throw error;
+            // Espera exponencial entre reintentos (3s, 6s, 9s...)
             await new Promise(resolve => setTimeout(resolve, Math.min(attempt * 3, 15) * 1000));
         }
     }
